@@ -1,0 +1,981 @@
+---
+title: "SC_multiomics_ATAC_RNA"
+author: "Lucas Merlicek"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# set own root dir
+knitr::opts_knit$set(root.dir = '')
+
+library(Seurat)
+library(Signac)
+library(Matrix)
+library(dplyr)
+library(hdf5r)
+library(AnnotationHub)
+library(ensembldb)
+library(biovizBase)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(limma)
+library(qlcMatrix)
+library(TFBSTools)
+library(JASPAR2020)
+library(motifmatchr)
+library(devtools)
+library(chromVAR)
+library(Pando)
+library(doParallel)
+library(grr)
+library(tidyr)
+library(tidygraph)
+library(ggraph)
+library(shiny)
+
+
+```
+
+## Section 1: Mono-modal integrative analysis of the RNA-ATAC scMultiome data
+
+
+# Step 1. Load the data and create the Seurat object
+
+```{r, warning = FALSE}
+#read in RNA/ATAC h5 matrix (35 week old human retinal organoid)
+counts <- Read10X_h5("Data/filtered_feature_bc_matrix.h5")
+
+#get human genome annotation (vhg38)
+ah <- AnnotationHub()
+ensdbs <- query(ah, c("EnsDb.Hsapiens"))
+ensdb_id <- ensdbs$ah_id[grep(paste0(" 98 EnsDb"), ensdbs$title)]
+ensdb <- ensdbs[[ensdb_id]]
+seqlevelsStyle(ensdb) <- "UCSC"
+annotations <- GetGRangesFromEnsDb(ensdb = ensdb)
+genome(annotations) <- "hg38"
+```
+
+```{r}
+#create Seurat object for each sample (expression count RNA; fragment count ATAC)
+seurat <- CreateSeuratObject(counts = counts$`Gene Expression`,
+                                 assay = "RNA",
+                                 project = "RO")
+seurat[['ATAC']] <- CreateChromatinAssay(counts = counts$`Peaks`,
+                                             annotation = annotations,
+                                             fragments = "Data/atac_fragments.tsv.gz",
+                                             sep = c(":", "-"),
+                                             genome = 'hg38')
+
+#union peak list to combine ATAC assay
+peaks <- reduce(unlist(as(seurat@assays$ATAC@ranges,
+                          "GRangesList")))
+peakwidths <- width(peaks)
+peaks <- peaks[peakwidths < 10000 & peakwidths > 20]
+counts_atac_merged <- FeatureMatrix(seurat@assays$ATAC@fragments,
+                                    features = peaks,
+                                    cells = colnames(seurat))
+seurat[['ATAC']] <- CreateChromatinAssay(counts_atac_merged,
+                                         fragments = seurat@assays$ATAC@fragments,
+                                         annotation = seurat@assays$ATAC@annotation,
+                                         sep = c(":","-"),
+                                         genome = "hg38")
+```
+
+```{r, eval = FALSE}
+#ALTERNATIVE
+#redo peak calling to combine ATAC assay (via CallPeaks)
+peaks <- CallPeaks(seurat,
+                   assay="ATAC",
+                   group.by="orig.ident",
+                   macs2.path="Data/macs2")
+counts_atac <- FeatureMatrix(seurat@assays$ATAC@fragments,
+                             features = peaks,
+                             cells = colnames(seurat))
+seurat[['ATAC']] <- CreateChromatinAssay(counts_atac,
+                                         fragments = seurat@assays$ATAC@fragments,
+                                         annotation = seurat@assays$ATAC@annotation,
+                                         genome = 'hg38')
+```
+
+```{r}
+#isolate only standard chromosomes
+standard_chroms <- standardChromosomes(BSgenome.Hsapiens.UCSC.hg38)
+idx_standard_chroms <- which(as.character(seqnames(granges(seurat[['ATAC']]))) %in% standard_chroms)
+seurat[["ATAC"]] <- subset(seurat[["ATAC"]],
+                           features = rownames(seurat[["ATAC"]])[idx_standard_chroms])
+seqlevels(seurat[['ATAC']]@ranges) <- intersect(seqlevels(granges(seurat[['ATAC']])),
+                                                unique(seqnames(granges(seurat[['ATAC']]))))
+```
+
+
+# Step 2: Quality Control
+
+```{r}
+#RNA: check detected genes/transcript #, % mtRNA
+#ATAC: check detected peaks/fragments #, too weak fragment around TSS,
+#      discard fragments with single nucleosome length
+
+seurat <- PercentageFeatureSet(seurat, pattern = "^MT-", col.name = "percent.mt", assay = "RNA")
+seurat <- NucleosomeSignal(seurat, assay = "ATAC")
+seurat <- TSSEnrichment(seurat, assay = "ATAC")
+
+VlnPlot(seurat,
+        features = c("nFeature_RNA",
+                     "percent.mt",
+                     "nFeature_ATAC",
+                     "TSS.enrichment",
+                     "nucleosome_signal"),
+        ncol = 5,
+        pt.size = 0)
+
+#manually set threshold for each feature
+#tutorial: subset = nFeature_RNA > 1000 &, nFeature_RNA < 7500 &, percent.mt < 30 &, nFeature_ATAC > 1000 &, nFeature_ATAC < 30000, TSS.enrichment > 1 &, nucleosome_signal < 2
+
+seurat <- subset(seurat,
+  subset = nFeature_RNA > 500 &
+    nFeature_RNA < 6000 &
+    percent.mt < 20 &
+    nFeature_ATAC > 500 &
+    nFeature_ATAC < 12000 &
+    TSS.enrichment > 1 &
+    nucleosome_signal < 3
+)
+```
+
+
+# Step 3: Analysis of the RNA Assay
+
+```{r}
+#RNA analysis pipeline
+#plot representative marker expression for major cell types (retina)
+DefaultAssay(seurat) <- "RNA"
+seurat <- NormalizeData(seurat) %>%          #data normalization
+  FindVariableFeatures(nfeatures = 3000) %>% #highly variable genes identification
+  CellCycleScoring(s.features = cc.genes.updated.2019$s.genes,
+                   g2m.features = cc.genes.updated.2019$g2m.genes) %>%
+  ScaleData() %>%
+  RunPCA(npcs = 50) %>%
+  RunUMAP(dims = 1:20, reduction.name = "umap_rna", reduction.key = "UMAPRNA_")
+
+p1 <- DimPlot(seurat, group.by = "orig.ident", reduction = "umap_rna") & NoAxes()
+#plot sig. cell marker genes from Wahle et al. 2023
+p2 <- FeaturePlot(seurat,
+                  c("NR2E3", "EBF3","NEUROG1","TFAP2A","PRDM8","TFAP2B","EGR2","MYRF"),
+reduction = "umap_rna") & NoAxes() & NoLegend()
+
+p1 | p2
+
+#some cell types might have already died out so markers not visible (organoid 35 weeks)
+```
+
+```{r}
+DefaultAssay(seurat) <- "RNA"
+
+#clustering
+seurat <- FindNeighbors(seurat, dims = 1:ncol(Embeddings(seurat, assay = "RNA"))) %>%
+  FindClusters(resolution = 0.2)
+
+##cluster marker identification (DE genes in each cluster)
+DE_cl_rna <- presto::wilcoxauc(seurat, "RNA_snn_res.0.2")
+top_markers <- DE_cl_rna %>%
+  dplyr::filter(logFC > log(1.2) &
+         auc > 0.7 &
+         padj < 0.01 &
+         pct_in - pct_out > 30 &
+         pct_out < 30) %>%
+  group_by(group) %>%
+  top_n(1, wt = auc)
+
+##plot clusters
+p1 <- DimPlot(seurat,
+              group.by="RNA_snn_res.0.2",
+              reduction="umap_rna", label=T) & NoAxes() & NoLegend()
+p2 <- FeaturePlot(seurat,
+                  features = unique(top_markers$feature),
+                  reduction="umap_rna",
+                  order = T,
+                  ncol=3) & NoAxes() & NoLegend()
+(p1 | p2) + patchwork::plot_layout(widths = c(2,3))
+
+p1 + ggtitle("RNA-seq. UMAP clustering")
+```
+
+```{r, eval =FALSE}
+## ALTERNATIVE to presto via FindAllMarkers
+#clustering
+seurat <- FindNeighbors(seurat, dims = 1:ncol(Embeddings(seurat,assay = "RNA"))) %>%
+          FindClusters(resolution = 0.2)
+
+##cluster marker identification
+DE_cl_rna <- FindAllMarkers(seurat, only.pos = TRUE, min.pct = 0.25, logfc.threshold = log(1.2), test.use = "wilcox")
+
+top_markers <- DE_cl_rna %>% group_by(cluster) %>% top_n(n = 1, wt = avg_log2FC)
+
+#DoHeatmap(seurat, features = top10_markers$gene) + NoLegend()
+
+top_markers <- DE_cl_rna %>%
+  dplyr::filter(avg_log2FC > log(1.2) &
+         p_val_adj < 0.01 &
+         pct.1 - pct.2 > 0.30 &
+         pct.2 < 0.30) %>%
+  group_by(cluster) %>%
+  top_n(1, wt = pct.1 - pct.2)
+
+
+##plot clusters
+p1 <- DimPlot(seurat,
+              group.by="RNA_snn_res.0.2",
+              reduction="umap_rna", label=T) & NoAxes() & NoLegend()
+p2 <- FeaturePlot(seurat,
+                  features = unique(top_markers$gene),
+                  reduction="umap_rna",
+                  order = TRUE,
+                  ncol=3) & NoAxes() & NoLegend()
+
+(p1 | p2) + patchwork::plot_layout(widths = c(2,3))
+```
+
+# Step 4: Analysis of the ATAC Assay
+
+```{r}
+#4.1 feature selection
+#only select peaks in >50 cells
+DefaultAssay(seurat) <- "ATAC"
+seurat <- FindTopFeatures(seurat, min.cutoff = 50)
+
+#4.2 Normalization
+seurat <- RunTFIDF(seurat, method = 1)
+
+#4.3 Linear dimension reduction
+seurat <- RunSVD(seurat, n = 50)
+```
+
+```{r}
+#4.4 non-linear dimension reduction with UMAP for visualization
+#check how many SVD components to use
+p1 <- ElbowPlot(seurat, ndims = 30, reduction="lsi")
+p2 <- DepthCor(seurat, n = 30)
+p1 | p2
+
+#UMAP embedding with 2-30 SVD component (omit 1 -> technical not bio variance)
+seurat <- RunUMAP(seurat,
+                  reduction = "lsi",
+                  dims = 2:30,
+                  reduction.name = "umap_atac",
+                  reduction.key = "UMAPATAC_")
+p1 <- DimPlot(seurat,
+group.by = "orig.ident",
+              reduction = "umap_atac") & NoAxes()
+
+p2 <- FeaturePlot(seurat,
+c("NR2E3", "EBF3","NEUROG1","TFAP2A","PRDM8","TFAP2B","EGR2","MYRF"),
+reduction = "umap_atac") & NoAxes() & NoLegend()
+
+p1 | p2
+
+p1 + ggtitle("ATAC-seq. UMAP embedding")
+```
+
+## Section 2: Bi-modal integrative analysis of the RNA-ATAC scMultiome data
+
+Integrate RNA and ATAC assays to identify cell type heterogeneity, and look for putative cis- and trans-regulatory elements that could be important for cell type/state identity establishment, maintenance and transition. 
+
+# Step 1: Weighted nearest neighbor analysis
+
+```{r}
+#calculated weighted nearest neighbor analysis (combined RNA and ATAC)
+seurat <- FindMultiModalNeighbors(seurat,
+                                  reduction.list = list("pca", "lsi"),
+                                  dims.list = list(1:ncol(Embeddings(seurat, "pca")),
+                                                   2:ncol(Embeddings(seurat, "lsi"))),
+                                  modality.weight.name = c("RNA.weight","ATAC.weight"),
+                                  verbose = TRUE)
+
+#UMAP with weighted nearest neighbor
+seurat <- RunUMAP(seurat, nn.name = "weighted.nn", assay = "RNA")
+seurat <- FindClusters(seurat, graph.name = "wsnn", resolution = 0.2)
+p1 <- UMAPPlot(seurat, group.by = "orig.ident") & NoAxes()
+p2 <- UMAPPlot(seurat, group.by = "wsnn_res.0.2", label=T) & NoAxes() & NoLegend()
+p3 <- FeaturePlot(seurat,
+                  c("NR2E3", "EBF3","NEUROG1","TFAP2A","PRDM8","TFAP2B","EGR2","MYRF"),
+                  reduction = "umap") & NoAxes() & NoLegend()
+p1 | p2 | p3
+
+p2 + ggtitle("weighted kNN UMAP clustering of both RNA & ATAC data")
+
+#find top genes for clusters
+DE_ct <- presto::wilcoxauc(seurat, "seurat_clusters", seurat_assay = "RNA")
+top_clusters_ct <- DE_ct %>%
+  dplyr::filter(abs(logFC) > log(1.2) &
+         padj < 0.01 &
+         auc > 0.65 &
+         pct_in - pct_out > 30 &
+         pct_out < 20) %>%
+  group_by(group) %>%
+  top_n(10, wt = auc)
+
+```
+
+
+```{r}
+#Annotation, gene list from Wahle et al. 2023, cluster correspond to cell type from paper
+
+#full list
+#marker_genes <- list(c("CYP1B1", "HES5", "NME4", "ISYNA1", "CD99", "PRSS23"),c("ТТС9B", "ELAVL3", "GNG3", "CHRNB3", "EBF3", "EBF1", "POU4F2", "SLC18A2", "POU6F2", "CNTN2", "NEFM", "ELAVL4", "NEFL", "RAB31", "ID3", "TMSB15A"),c( "GRIA4", "TNR", "TFAP2B", "ONECUT1", "PLXNA2", "ONECUT2", "APBB2", "PROX1", "CNTNAP2"),c( "GAD1", "RUNX1T1", "PLPPR1", "MIR181A1HG", "NRXN1"),c( "TMEM215", "CA10", "GNG13", "VSX1", "HPCA", "DOK6", "IGSF21", "NEUROD4", "MAP7", "CADPS"),c( "AC023905.1", "GNAT2", "PEX5L", "KCNB2", "MYL4", "NXNL1", "SLC38A5", "RRAD", "SH3GL2", "MLXIP"),c( "PDE6A", "CLUL1", "NR2E3", "CABP5", "SAG", "GNAT1", "REEP6", "GPR160", "PRPH2", "AL451062.1"),c( "F3", "FLT1", "CFI", "OAF", "LGALS3", "PHLDA1", "LGI4", "WIF1", "CRYM"),c( "RLBP1", "SFRP1", "SFRP5", "PLD5", "OC90", "NCCRP1", "MET", "COL8A1", "ATP6V1C2", "TYRP1", "TRPM1"))
+
+#more specific list with no coexpression in other cell types:
+marker_genes <- list(c("CYP1B1", "HES5", "NME4", "ISYNA1", "CD99", "PRSS23"),c("CHRNB3", "EBF3", "EBF1", "POU4F2", "SLC18A2", "POU6F2", "CNTN2", "NEFM", "ELAVL4", "NEFL"),c( "GRIA4", "TNR", "TFAP2B", "ONECUT1", "PLXNA2", "ONECUT2", "APBB2", "PROX1", "CNTNAP2"),c("TFAP2A", "GAD1"),c( "TMEM215", "CA10", "GNG13", "VSX1"),c( "AC023905.1", "GNAT2", "PEX5L", "KCNB2", "MYL4", "NXNL1", "SLC38A5", "RRAD", "SH3GL2", "MLXIP"),c( "PDE6A", "CLUL1", "NR2E3", "CABP5", "SAG", "GNAT1", "REEP6", "GPR160", "PRPH2", "AL451062.1"),c( "F3", "FLT1", "CFI", "OAF", "LGALS3", "PHLDA1", "LGI4", "WIF1", "CRYM"),c( "RLBP1", "SFRP1", "SFRP5", "PLD5", "OC90", "NCCRP1", "MET", "COL8A1", "ATP6V1C2", "TYRP1", "TRPM1"))
+
+DefaultAssay(seurat) <- "RNA"
+seurat <- AddModuleScore(seurat, marker_genes)
+FeaturePlot(seurat, c("RPC","RGC","HC","AC", "BC", "Cone", "Rod", "MG", "RPE"), order=T, reduction = "umap")
+
+#correlate gene cluster to cell typevisually
+seurat$celltype <- setNames(rep(c("RPC","HC","AC", "BC", "Cone", "Rod", "MG", "RPE"), 
+                                c(1,1,1,3, 1, 1, 2, 1)), #number of clusters per cell type
+                                c(7,6,11, c(8,9,10), 1, 0, c(3,4), 5))[as.character(seurat$wsnn_res.0.2)] # correspdonding UMAP clusters
+
+p_cluster_celltypes <- UMAPPlot(seurat, group.by = "celltype",label=TRUE, cols = c("RPC"="#92BFE5","BC (RGC?)"="#387866","HC"="#4DA28A","AC"="#40814E", "BC"="#CEAE3C", "Cone"="#D8833B", "Rod"="#BC4D3D", "MG"="#437EB4", "RPE"="#2E578B")) & NoAxes() 
+p_cluster_celltypes+ ggtitle("Cell type annotations based on Wahle, et al. 2023")
+
+FeaturePlot(seurat, c("RPC","RGC","HC","AC", "BC", "Cone", "Rod", "MG", "RPE"), order=T, reduction = "umap") & NoLegend()
+
+
+#plot all clusters seperately
+FeaturePlot(seurat, "Cluster1", order=T, reduction = "umap")
+FeaturePlot(seurat, "Cluster2", order=T, reduction = "umap")
+FeaturePlot(seurat, "Cluster3", order=T, reduction = "umap")
+FeaturePlot(seurat, "Cluster4", order=T, reduction = "umap")
+FeaturePlot(seurat, "Cluster5", order=T, reduction = "umap")
+FeaturePlot(seurat, "Cluster6", order=T, reduction = "umap")
+FeaturePlot(seurat, "Cluster7", order=T, reduction = "umap")
+FeaturePlot(seurat, "Cluster8", order=T, reduction = "umap")
+FeaturePlot(seurat, "Cluster9", order=T, reduction = "umap")
+
+```
+
+# Step 2. Cell type gene/peak marker identification and visualization of the chromatin
+
+```{r}
+#cell type
+DefaultAssay(seurat) <- "RNA"
+
+#RNA differential expression analysis
+DE_ct <- presto::wilcoxauc(seurat, "celltype", seurat_assay = "RNA")
+top_markers_ct <- DE_ct %>%
+  dplyr::filter(abs(logFC) > log(1.2) &
+         padj < 0.01 &
+         auc > 0.65 &
+         pct_in - pct_out > 30 &
+         pct_out < 20) %>%
+  group_by(group) %>% View()
+  top_n(10, wt = auc)
+#top_markers_ct %>% top_n(1, wt = auc) %>% View()
+
+#ATAC differential accessibility analysis
+DefaultAssay(seurat) <- "ATAC"
+DA_ct <- presto::wilcoxauc(seurat, "celltype", seurat_assay = "ATAC")
+top_peaks_ct <- DA_ct %>%
+  dplyr::filter(abs(logFC) > log(1.1) &
+         padj < 0.01 &
+         auc > 0.55) %>%
+  group_by(group) %>% View()
+  top_n(100, wt = auc)
+top_peaks_ct %>% top_n(5, wt=auc) -> top_5_peaks_ct
+#top_peaks_ct %>% top_n(1, wt=auc) %>% View()
+```
+
+
+```{r eval=FALSE, include=FALSE}
+## ALTERNATIVE to presto via FindAllMarkers
+#####CAVE ATAC peaks changed parameters for top peaks to find all cell types
+#cell type
+
+#set new ident to cell type (revert with "orig.ident")
+Idents(object = seurat) <- seurat@meta.data[["celltype"]]
+#RNA differential expression analysis
+DE_ct <- FindAllMarkers(seurat, group_by = "celltype", assay = "RNA", only.pos = TRUE, logfc.threshold = log(1.2), test.use = "wilcox")
+
+top_markers <- DE_cl_rna %>%
+  dplyr::filter(avg_log2FC > log(1.2) &
+         p_val_adj < 0.01 &
+         pct.1 - pct.2 > 0.30 &
+         pct.2 < 0.30) %>%
+  group_by(cluster) %>%
+  top_n(1, wt = pct.1 - pct.2)
+
+
+#ATAC differential accessibility analysis
+DefaultAssay(seurat) <- "ATAC"
+DA_ct <- FindAllMarkers(seurat, group_by = "celltype", assay = "ATAC", only.pos = TRUE, logfc.threshold = log(1.2), test.use = "wilcox")
+top_peaks_ct <- DA_ct %>%
+  dplyr::filter(abs(avg_log2FC) > log(1.2) &
+         p_val_adj < 0.01 &
+         pct.1 - pct.2 > 0.12 &
+         pct.2 < 0.35) %>%
+  group_by(cluster) %>%
+  top_n(100, wt = pct.1 - pct.2)
+top_peaks_ct %>% top_n(5, wt=pct.1 - pct.2)
+
+
+#link gene with nearby ATAC peaks (pot. cis-regulatory regions)
+
+seurat <- RegionStats(seurat,
+                      genome = BSgenome.Hsapiens.UCSC.hg38)
+seurat <- LinkPeaks(seurat,
+                    peak.assay = "ATAC",
+                    expression.assay = "RNA",
+                    genes.use = top_markers_ct$gene)
+```
+
+```{r}
+#remove cell-type NA
+seurat$celltype[which(is.na(seurat$celltype))] = 'undetermined'
+
+#top marker for RNA cell type
+top_markers_ct %>% group_by(group) %>% top_n(1, wt = auc) %>% View() 
+ 
+#check the ATAC accessibility patterns in cell types for top gene marker of cell type
+DefaultAssay(seurat) <- "ATAC"
+
+#use GENES (top_markers_ct)
+#BC
+p_BC <- CoveragePlot(seurat,
+                   region = "CA10", 
+                   features = "CA10",
+                   group.by = "celltype",
+                   extend.upstream = 1000,
+                   extend.downstream = 1000)
+
+#Cone
+p_cone <- CoveragePlot(seurat,
+                   region = "PDE6H", 
+                   features = "PDE6H",
+                   group.by = "celltype",
+                   extend.upstream = 1000,
+                   extend.downstream = 1000)
+
+#HC
+p_HC <- CoveragePlot(seurat,
+                   region = "STMN2", 
+                   features = "STMN2",
+                   group.by = "celltype",
+                   extend.upstream = 1000,
+                   extend.downstream = 1000)
+
+#MG
+p_MG <- CoveragePlot(seurat,
+                   region = "AKAP12", 
+                   features = "AKAP12",
+                   group.by = "celltype",
+                   extend.upstream = 1000,
+                   extend.downstream = 1000)
+
+#RPE
+p_RPE <- CoveragePlot(seurat,
+                   region = "TRPM1", 
+                   features = "TRPM1",
+                   group.by = "celltype",
+                   extend.upstream = 1000,
+                   extend.downstream = 1000)
+
+#RPC
+p_RP <- CoveragePlot(seurat,
+                   region = "CPAMD8", 
+                   features = "CPAMD8",
+                   group.by = "celltype",
+                   extend.upstream = 1000,
+                   extend.downstream = 1000)
+
+#Rod
+p_rod <- CoveragePlot(seurat,
+                   region = "GNAT1",
+                   features = "GNAT1",
+                   group.by = "celltype",
+                   extend.upstream = 1000,
+                   extend.downstream = 1000)
+
+#AC
+p_AC <- CoveragePlot(seurat,
+                   region = "PCDH11X",
+                   features = "PCDH11X",
+                   group.by = "celltype",
+                   extend.upstream = 1000,
+                   extend.downstream = 1000)
+#BC_RGC
+p_RGC <- CoveragePlot(seurat,
+                   region = "NETO1",
+                   features = "NETO1",
+                   group.by = "celltype",
+                   extend.upstream = 1000,
+                   extend.downstream = 1000)
+
+patchwork::wrap_plots(p_RP, p_RGC, ncol = 1)
+patchwork::wrap_plots(p_HC, p_AC, ncol = 1)
+patchwork::wrap_plots(p_BC, p_cone, ncol = 1)
+patchwork::wrap_plots(p_rod, p_MG, ncol = 1)
+p_rod
+p_cone
+
+```
+
+```{r}
+#top2 ATAC cell type regions
+top_peaks_ct %>% group_by(group) %>% top_n(1, wt = auc)
+
+#bipolar cell cytoplasm
+p_BC <- CoveragePlot(seurat,
+                   region = "chr20-35096216-35096906",
+                   group.by = "celltype",
+                   extend.upstream = 1000,
+                   extend.downstream = 1000)
+
+#Cone
+p_cone <- CoveragePlot(seurat,
+                   region = "chr2-181679416-181685338", 
+                   group.by = "celltype",
+                   extend.upstream = 1000,
+                   extend.downstream = 1000)
+
+#horizontal cells
+p_HC <- CoveragePlot(seurat,
+                   region = "chr22-23565459-23566833", 
+                   group.by = "celltype",
+                   extend.upstream = 1000,
+                   extend.downstream = 1000)
+
+#Müller glia
+p_MG <- CoveragePlot(seurat,
+                   region = "chr19-54420076-54421480", 
+                   group.by = "celltype",
+                   extend.upstream = 1000,
+                   extend.downstream = 1000)
+
+#retinal pigment epithelial
+p_RPE <- CoveragePlot(seurat,
+                   region = "chr1-43066511-43070243", 
+                   group.by = "celltype",
+                   extend.upstream = 1000,
+                   extend.downstream = 1000)
+
+#retinal progenitor cells
+p_RP <- CoveragePlot(seurat,
+                   region = "chr3-194133627-194138292	", 
+                   group.by = "celltype",
+                   extend.upstream = 1000,
+                   extend.downstream = 1000)
+
+#Rod 
+p_rod <- CoveragePlot(seurat,
+                   region = "chr2-181679416-181685338	",
+                   group.by = "celltype",
+                   extend.upstream = 1000,
+                   extend.downstream = 1000)
+
+#AC
+p_AC <- CoveragePlot(seurat,
+                   region = "chr19-53908005-53910262",
+                   group.by = "celltype",
+                   extend.upstream = 1000,
+                   extend.downstream = 1000)
+#BC_RGC
+p_RGC <- CoveragePlot(seurat,
+                   region = "chr1-180229071-180231788",
+                   group.by = "celltype",
+                   extend.upstream = 1000,
+                   extend.downstream = 1000)
+
+patchwork::wrap_plots(p_BC, p_cone, ncol = 1)
+patchwork::wrap_plots(p_HC, p_MG, ncol = 1)
+patchwork::wrap_plots(p_RPE, p_RP, ncol = 1)
+p_rod
+p_cone
+p_RPE
+
+```
+
+
+# Step 3. TF binding motif enrichment analysis
+
+```{r}
+#scan motifs enriched in celltype-specific peaks -> identify TF binding motifs 
+#convert list of binding motifs from JASPAR db
+pfm <- getMatrixSet(
+  x = JASPAR2020,
+  opts = list(collection = "CORE", tax_group = 'vertebrates', all_versions = FALSE)
+)
+df_pfm <- data.frame(t(sapply(pfm, function(x)
+  c(id=x@ID, name=x@name, symbol=ifelse(!is.null(x@tags$symbol),x@tags$symbol,NA)))))
+
+#scan motifs
+seurat <- AddMotifs(seurat, genome = BSgenome.Hsapiens.UCSC.hg38, pfm = pfm)
+```
+
+```{r}
+#identify enriched TF binding motifs in our peak list (cell-type specific)
+DefaultAssay(seurat) <- "ATAC"
+open_peaks <- AccessiblePeaks(seurat)
+
+peaks_matched <- MatchRegionStats(meta.feature = seurat[['ATAC']]@meta.features[open_peaks, ],
+                                  query.feature = seurat[['ATAC']]@meta.features[top_peaks_ct$feature, ],
+                                  n = 50000)
+
+
+#bipolar cell cytoplasm	
+motif_enrichment_BP <- FindMotifs(seurat,
+                                    features = top_peaks_ct$feature[top_peaks_ct$group == "BC"],
+                                    background = peaks_matched) %>%
+  mutate(symbol = setNames(ifelse(is.na(df_pfm$symbol), df_pfm$name, df_pfm$symbol), df_pfm$id)[motif]) %>%
+  mutate(padj = p.adjust(pvalue, method="BH"))
+enriched_motif_BP <- motif_enrichment_BP %>%
+  dplyr::filter(padj < 0.01 & fold.enrichment > 3) %>%
+  top_n(-6, wt = padj)
+
+#Cone
+motif_enrichment_Cone <- FindMotifs(seurat,
+                                    features = top_peaks_ct$feature[top_peaks_ct$group == "Cone"],
+                                    background = peaks_matched) %>%
+  mutate(symbol = setNames(ifelse(is.na(df_pfm$symbol), df_pfm$name, df_pfm$symbol), df_pfm$id)[motif]) %>%
+  mutate(padj = p.adjust(pvalue, method="BH"))
+enriched_motif_Cone <- motif_enrichment_Cone %>%
+  dplyr::filter(padj < 0.01 & fold.enrichment > 3) %>%
+  top_n(-6, wt = padj)
+
+#horizontal cells
+motif_enrichment_HC <- FindMotifs(seurat,
+                                    features = top_peaks_ct$feature[top_peaks_ct$group == "HC"],
+                                    background = peaks_matched) %>%
+  mutate(symbol = setNames(ifelse(is.na(df_pfm$symbol), df_pfm$name, df_pfm$symbol), df_pfm$id)[motif]) %>%
+  mutate(padj = p.adjust(pvalue, method="BH"))
+enriched_motif_HC <- motif_enrichment_HC %>%
+  dplyr::filter(padj < 0.01 & fold.enrichment > 3) %>%
+  top_n(-6, wt = padj)
+
+#Müller glia
+motif_enrichment_MG <- FindMotifs(seurat,
+                                    features = top_peaks_ct$feature[top_peaks_ct$group == "MG"],
+                                    background = peaks_matched) %>%
+  mutate(symbol = setNames(ifelse(is.na(df_pfm$symbol), df_pfm$name, df_pfm$symbol), df_pfm$id)[motif]) %>%
+  mutate(padj = p.adjust(pvalue, method="BH"))
+enriched_motif_MG <- motif_enrichment_MG %>%
+  dplyr::filter(padj < 0.01 & fold.enrichment > 3) %>%
+  top_n(-6, wt = padj)
+
+#retinal pigment epithelial
+motif_enrichment_RPE <- FindMotifs(seurat,
+                                    features = top_peaks_ct$feature[top_peaks_ct$group == "RPE"],
+                                    background = peaks_matched) %>%
+  mutate(symbol = setNames(ifelse(is.na(df_pfm$symbol), df_pfm$name, df_pfm$symbol), df_pfm$id)[motif]) %>%
+  mutate(padj = p.adjust(pvalue, method="BH"))
+enriched_motif_RPE <- motif_enrichment_RPE %>%
+  dplyr::filter(padj < 0.01 & fold.enrichment > 3) %>%
+  top_n(-6, wt = padj)
+
+#retinal progenitor cells
+motif_enrichment_RP <- FindMotifs(seurat,
+                                    features = top_peaks_ct$feature[top_peaks_ct$group == "RPC"],
+                                    background = peaks_matched) %>%
+  mutate(symbol = setNames(ifelse(is.na(df_pfm$symbol), df_pfm$name, df_pfm$symbol), df_pfm$id)[motif]) %>%
+  mutate(padj = p.adjust(pvalue, method="BH"))
+enriched_motif_RP <- motif_enrichment_RP %>%
+  dplyr::filter(padj < 0.01 & fold.enrichment > 3) %>%
+  top_n(-6, wt = padj)
+
+#Rod
+
+motif_enrichment_Rod <- FindMotifs(seurat,
+                                     features = top_peaks_ct$feature[top_peaks_ct$group == "Rod"],
+                                     background = peaks_matched) %>%
+  mutate(symbol = setNames(ifelse(is.na(df_pfm$symbol), df_pfm$name, df_pfm$symbol), df_pfm$id)[motif]) %>%
+  mutate(padj = p.adjust(pvalue, method="BH"))
+enriched_motif_Rod <- motif_enrichment_Rod %>%
+  dplyr::filter(padj < 0.01 & fold.enrichment > 3) %>%
+  top_n(-6, wt = padj)
+
+#AV
+
+motif_enrichment_AC <- FindMotifs(seurat,
+                                     features = top_peaks_ct$feature[top_peaks_ct$group == "AC"],
+                                     background = peaks_matched) %>%
+  mutate(symbol = setNames(ifelse(is.na(df_pfm$symbol), df_pfm$name, df_pfm$symbol), df_pfm$id)[motif]) %>%
+  mutate(padj = p.adjust(pvalue, method="BH"))
+enriched_motif_AC <- motif_enrichment_AC %>%
+  dplyr::filter(padj < 0.01 & fold.enrichment > 3) %>%
+  top_n(-6, wt = padj)
+
+
+#plot top 4 overrepresented TF binding motifs for cell types
+p_BP <- MotifPlot(seurat, motifs = enriched_motif_BP$motif[1:6], ncol = 6)
+p_cone <- MotifPlot(seurat, motifs = enriched_motif_Cone$motif[1:6], ncol=6)
+p_BP / p_cone
+
+p_HC <- MotifPlot(seurat, motifs = enriched_motif_HC$motif[1:6], ncol = 6)
+p_MG <- MotifPlot(seurat, motifs = enriched_motif_MG$motif[1:6], ncol=6)
+p_HC / p_MG
+
+p_RPE <- MotifPlot(seurat, motifs = enriched_motif_RPE$motif[1:6], ncol = 6)
+p_RP <- MotifPlot(seurat, motifs = enriched_motif_RP$motif[1:6], ncol=6)
+p_RPE / p_RP
+
+p_Rod <- MotifPlot(seurat, motifs = enriched_motif_Rod$motif[1:6], ncol = 6)
+p_AC <- MotifPlot(seurat, motifs = enriched_motif_AC$motif[1:6], ncol = 6)
+p_Rod / p_AC
+```
+```{r, warning =FALSE}
+#check expression of corresponding TFs
+DefaultAssay(seurat) <- "RNA"
+
+# Loop through the variable suffixes for enriched motif plots
+for (i in c("RP", "HC", "AC", "BP", "Cone", "Rod", "MG", "RPE")) {
+  # Construct the variable name using paste0
+  temp_name <- get(paste0("enriched_motif_", i))
+  
+  # Access the "motif.name" column within the data frame
+  motif_names <- temp_name$motif.name
+  
+  # Create the feature plot for the current variable
+  plot_title <- paste0("p_", i)
+  feature_plot <- FeaturePlot(seurat,
+                              motif_names,
+                              reduction = "umap",
+                              order = TRUE,
+                              ncol = 4) & NoAxes() & NoLegend()
+  
+  # Print the feature plot
+  print(feature_plot)
+}
+p_cluster_celltypes
+##if not cell-type specific: not bio relevant, not critcial celltype defined TF
+##check more details, not just top 4
+
+for (i in c("RP", "HC", "AC", "BP", "Cone", "Rod", "MG", "RPE")) {
+  # Construct the variable name using paste0
+  temp_name <- get(paste0("enriched_motif_", i))
+  
+  # Access the "motif.name" column within the data frame
+  motif_names[i] <- temp_name$motif.name}
+```
+
+# Step 4: ChromVAR: another motif enrichment analysis
+
+```{r}
+#estimates motif activity score for each motif on cell level
+
+#create chromvar assay (JASPAR motifs and chromvar est. accessibility scores)
+seurat <- RunChromVAR(seurat, genome = BSgenome.Hsapiens.UCSC.hg38, assay ="ATAC")
+
+#new differential activity analysis with chromvar
+DefaultAssay(seurat) <- "chromvar"
+
+DA_motifs_ct <- presto::wilcoxauc(seurat, group_by = "celltype", seurat_assay = "chromvar") %>%
+  mutate(symbol = setNames(ifelse(is.na(df_pfm$symbol), df_pfm$name, df_pfm$symbol),
+                           df_pfm$id)[feature])
+enriched_motifs_ct <- DA_motifs_ct %>%
+  dplyr::filter(padj < 0.01 & auc > 0.7) %>%
+  group_by(group)
+top_motifs_ct <- top_n(enriched_motifs_ct, 1, wt=auc)
+
+#plor enriched motifs directly
+bluered_colscheme <- colorRampPalette(rev(c("#d73027","#f46d43","#fdae61","#fee090","#e0f3f8","#abd9e9","#74add1","#4575b4")))
+FeaturePlot(seurat,
+            features = top_motifs_ct$feature,
+            cols = bluered_colscheme(30),
+            reduction = "umap",
+            ncol = 4) & NoAxes() & NoLegend()
+p_cluster_celltypes
+#order of cell type: AC, BC, Cone, HC, MG, Rod, RPC, RPE
+##change top number of motifs to 2 or 3
+```
+
+```{r}
+#together with the DE analysis on TFs between cell types ->
+#obtain list of TF (animalTFDB database)
+
+tfs <- read.table("/Data/Homo_sapiens_TF.txt", sep="\t", header=T)
+tf_motifs_ct <- enriched_motifs_ct %>%
+  dplyr::filter(symbol %in% tfs$Symbol)
+marker_tfs_ct <- DE_ct %>%
+  dplyr::filter(feature %in% tfs$Symbol &
+         abs(logFC) > log(1.2) &
+         padj < 0.01 &
+         auc > 0.65 &
+         pct_in - pct_out > 20) -> marker_tfs_ct_test  
+  inner_join(tf_motifs_ct,
+             by = c("feature" = "symbol"),
+             suffix = c("_tf","_motif")) %>%
+  filter(group_tf == group_motif)
+#results:enriched motif with also DE expressed Tf, IN THE SAME CELL TYPE
+
+top_tfs_ct <- group_by(marker_tfs_ct, group_tf) %>%
+  top_n(1, wt = auc_motif)
+
+#correlate DE of RNA with enriched motifs -> TFs
+beach_colscheme <- colorRampPalette(c("#cdcdcd","#edf8b1","#7fcdbb","#41b6c4","#1d91c0","#225ea8","#0c2c84"))
+
+DefaultAssay(seurat) <- "RNA"
+p1 <- FeaturePlot(seurat,
+                  top_tfs_ct$feature,
+                  reduction = "umap",
+                  order=T,
+                  cols=beach_colscheme(30),
+                  ncol=5) & NoAxes() & NoLegend()
+
+DefaultAssay(seurat) <- "chromvar"
+p2 <- FeaturePlot(seurat,
+                  top_tfs_ct$feature_motif,
+                  reduction = "umap",
+                  order=T,
+                  cols=bluered_colscheme(30),
+                  ncol=5) & NoAxes() & NoLegend()
+
+p1 / p2
+p_cluster_celltypes
+#AC; HC; MG; RPC; RPE
+```
+
+## Section 3: Gene regulatory network reconstruction
+
+Instead of focusing on different cell populations, we focus on relationship between genes, or more specifically, to identify the regulatory relationship of different TFs interacting with different cis-regulatory elements in order to regulate the transcription of different target genes. This is so-call the gene regulatory network (GRN) analysis.
+
+# Step 1: Initialize and fuse Pando object
+
+```{r}
+#initialize Pando compatibility, also include seq. conversation as phastCons scores
+seurat <- initiate_grn(seurat,
+                       regions=phastConsElements20Mammals.UCSC.hg38,
+                       rna_assay = "RNA", peak_assay = "ATAC")
+
+#incorporate TF binding motif info
+seurat <- find_motifs(seurat,
+                      pfm = Pando::motifs,
+                      motif_tfs = Pando::motif2tf,
+                      genome = BSgenome.Hsapiens.UCSC.hg38)
+```
+# Step 2: generate GRN
+
+```{r}
+#run pando with 20 cores parallel
+registerDoParallel(20)
+
+##Pando:
+#scans for TF motifs at each peak of ATAC, filter based on seq. conversion and ENCODE
+#for each gene build linear regression model 
+#with expression of regulating TF with predicted binding sites
+#with interaction with peak accessibility where putative TF binding site is located
+seurat <- infer_grn(seurat,
+                    parallel = T,
+                    tf_cor = 0.04,     #prefilter TF
+                    method="glm",
+                    family="gaussian",
+                    scale=F,
+                    verbose=T)
+
+#extract significant TF-peak-target trios
+grn <- seurat@grn@networks$glm_network@coefs %>%
+  dplyr::filter(padj < 0.01)
+```
+
+# Step 3: Regulons
+
+```{r}
+#generate list of regulons (group of genes co-regulated pos or neg. by same TF)
+positive_regulons <- split(grn$target[grn$estimate>0], grn$tf[grn$estimate>0])
+positive_regulons <- positive_regulons[lengths(positive_regulons) > 10]
+negative_regulons <- split(grn$target[grn$estimate<0], grn$tf[grn$estimate<0])
+negative_regulons <- negative_regulons[lengths(negative_regulons) > 10]
+
+
+#calculate regulon activity score for each regulon in each cell
+DefaultAssay(seurat) <- "RNA"
+
+mod_act_pos <- AddModuleScore(seurat,
+                              features = positive_regulons,
+                              name = "regulon_")@meta.data
+mod_act_pos <- mod_act_pos[,grep("^regulon_", colnames(mod_act_pos))] %>%
+  setNames(paste0(names(positive_regulons),"(+)"))
+
+mod_act_neg <- AddModuleScore(seurat,
+                              features = negative_regulons,
+                              name = "regulon_")@meta.data
+mod_act_neg <- mod_act_neg[,grep("^regulon_", colnames(mod_act_neg))] %>%
+  setNames(paste0(names(negative_regulons),"(-)"))
+seurat[['regulon']] <- CreateAssayObject(data = t(cbind(mod_act_pos, mod_act_neg)))
+```
+
+```{r}
+#feature plots for same TFs  found combining DE and chromVAR analysis, and their positive and negative regulons
+#try top_tfs_ct$features instead
+marker_tfs_ct_test %>% group_by(group) %>% top_n(1, wt=auc) -> marker_tfs_ct_test_top1
+DefaultAssay(seurat) <- "RNA"
+p1 <- FeaturePlot(seurat,
+                  marker_tfs_ct_test_top1$feature, #######
+                  reduction = "umap",
+                  cols = beach_colscheme(30),
+                  order = T,
+                  ncol = 8) & NoAxes() & NoLegend()
+DefaultAssay(seurat) <- "regulon"
+p2 <- FeaturePlot(seurat,
+                  features = c(intersect(paste0(marker_tfs_ct_test_top1$feature,"(+)"), rownames(seurat)),###
+                               intersect(paste0(marker_tfs_ct_test_top1$feature,"(-)"), rownames(seurat))),
+                  reduction = "umap",
+                  cols = bluered_colscheme(30),
+                  order = T,
+                  ncol = 4) & NoAxes() & NoLegend()
+(p1 / p2) + patchwork::plot_layout(height = c(1,1))
+
+p1
+p2
+
+```
+# Step 4: Visualization of GRN
+
+```{r}
+#TF module discovery (genes regulated by each TF)
+seurat <- find_modules(
+    seurat, 
+    p_thresh = 0.1,
+    nvar_thresh = 2, 
+    min_genes_per_module = 1, 
+    rsq_thresh = 0.05
+)
+
+#plot goodness of fit and size of modules
+p1 <- plot_gof(seurat, point_size=3)
+p2 <- plot_module_metrics(seurat)
+
+p1/p2
+```
+
+```{r}
+###Pando: visualization GRN -> github
+#https://quadbiolab.github.io/Pando/articles/visualization.html
+
+#graph based on umap embedding of nodes (grey: inhibitory, orange: activating)
+seurat <- get_network_graph(seurat, network = "glm_network", graph_name='umap_graph')
+plot_network_graph(seurat, graph='umap_graph')
+
+#other graph layouts (not umap)
+seurat <- get_network_graph(
+    seurat, 
+    graph_name = 'full_graph', 
+    umap_method = 'none'
+)
+p1 <- plot_network_graph(seurat, graph='full_graph', layout='fr', text_size=5)
+p2 <- plot_network_graph(seurat, graph='full_graph', layout='drl', text_size=5)
+p3 <- plot_network_graph(seurat, graph='full_graph', layout='eigen', text_size=5)
+p4 <- plot_network_graph(seurat, graph='full_graph', layout='matrix', text_size=5)
+(p1 | p2) / (p3 | p4)
+
+
+#default: graph labelled all TF, remove labels, look into source script (ggraph like ggplot2)
+```
+
+
+
+
+
+
+
+
+
